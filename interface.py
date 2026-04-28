@@ -72,6 +72,7 @@ GEMINI_API_KEY_ENV            = "GEMINI_API_KEY"
 GEMINI_TTS_MODEL_ENV          = "GEMINI_TTS_MODEL"
 GEMINI_TTS_VOICE_ENV          = "GEMINI_TTS_VOICE"
 GEMINI_TTS_AUDIO_MIME_ENV     = "GEMINI_TTS_AUDIO_MIME"
+GEMINI_TTS_ENDPOINT_ENV       = "GEMINI_TTS_ENDPOINT"
 GEMINI_TTS_MODEL              = "gemini-2.5-flash-preview-tts"
 GEMINI_TTS_VOICE              = ""       # ex: "Kore" pour test; choisir une voix FR disponible
 GEMINI_TTS_AUDIO_MIME         = "audio/wav"
@@ -127,6 +128,7 @@ class VoiceAssistant(threading.Thread):
         self._model     = os.getenv(GEMINI_TTS_MODEL_ENV, GEMINI_TTS_MODEL)
         self._voice     = os.getenv(GEMINI_TTS_VOICE_ENV, GEMINI_TTS_VOICE)
         self._mime      = os.getenv(GEMINI_TTS_AUDIO_MIME_ENV, GEMINI_TTS_AUDIO_MIME)
+        self._endpoint  = os.getenv(GEMINI_TTS_ENDPOINT_ENV, GEMINI_TTS_ENDPOINT)
         self._audio_ok  = False
         self._channel   = None
 
@@ -157,6 +159,7 @@ class VoiceAssistant(threading.Thread):
         self._actif = False
         if self._channel:
             self._channel.stop()
+            self._channel = None
         self._queue.put(("__EXTINCTION__", self._MSG_EXTINCTION))
 
     # ── Corps du thread ───────────────────────────────────
@@ -245,7 +248,7 @@ class VoiceAssistant(threading.Thread):
             }
 
         request = urllib.request.Request(
-            GEMINI_TTS_ENDPOINT.format(model=self._model),
+            self._endpoint.format(model=self._model),
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
@@ -303,14 +306,17 @@ class VoiceAssistant(threading.Thread):
         try:
             try:
                 sound = pygame.mixer.Sound(buffer=audio_bytes)
-            except pygame.error:
+            except pygame.error as e:
+                if "buffer" not in str(e).lower():
+                    print(f"[VOCAL] Erreur lecture audio : {e}")
+                    return False
                 # Compatibilité pygame 1.x: pas de support de buffer=.
                 sound = pygame.mixer.Sound(file=io.BytesIO(audio_bytes))
             self._channel = sound.play()
             if not self._channel:
                 return False
             start = time.time()
-            while self._channel.get_busy():
+            while self._channel and self._channel.get_busy():
                 if time.time() - start > timeout:
                     self._channel.stop()
                     return False

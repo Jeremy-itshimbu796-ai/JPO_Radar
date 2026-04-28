@@ -20,7 +20,6 @@ import sys
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 import pygame
@@ -70,7 +69,7 @@ MAX_LOGS         = 6
 # ── Gemini TTS ──────────────────────────────────────────────
 GEMINI_API_KEY_ENV            = "GEMINI_API_KEY"
 GEMINI_TTS_MODEL              = "gemini-2.5-flash-preview-tts"
-GEMINI_TTS_VOICE              = ""       # définir un nom de voix Gemini (ex: voix FR) si besoin
+GEMINI_TTS_VOICE              = ""       # ex: "Kore" (remplacer par une voix FR disponible)
 GEMINI_TTS_AUDIO_MIME         = "audio/wav"
 GEMINI_TTS_REQUEST_TIMEOUT_S  = 20
 
@@ -202,10 +201,15 @@ class VoiceAssistant(threading.Thread):
         if not self._init_audio():
             return False
 
-        audio = self._requete_tts(texte, timeout=GEMINI_TTS_REQUEST_TIMEOUT_S)
+        request_timeout = min(GEMINI_TTS_REQUEST_TIMEOUT_S, timeout)
+        start = time.time()
+        audio = self._requete_tts(texte, timeout=request_timeout)
         if not audio:
             return False
-        return self._lire_audio(audio, timeout=timeout)
+        remaining = timeout - (time.time() - start)
+        if remaining <= 0:
+            return False
+        return self._lire_audio(audio, timeout=remaining)
 
     def _init_audio(self) -> bool:
         if self._audio_ok:
@@ -238,11 +242,13 @@ class VoiceAssistant(threading.Thread):
             }
 
         url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        query = urllib.parse.urlencode({"key": self._api_key})
         request = urllib.request.Request(
-            f"{url.format(model=self._model)}?{query}",
+            url.format(model=self._model),
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": self._api_key,
+            },
         )
 
         try:

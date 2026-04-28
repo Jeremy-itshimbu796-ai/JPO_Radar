@@ -74,10 +74,10 @@ GEMINI_TTS_VOICE_ENV          = "GEMINI_TTS_VOICE"
 GEMINI_TTS_AUDIO_MIME_ENV     = "GEMINI_TTS_AUDIO_MIME"
 GEMINI_TTS_ENDPOINT_ENV       = "GEMINI_TTS_ENDPOINT"
 GEMINI_TTS_MODEL              = "gemini-2.5-flash-preview-tts"
-GEMINI_TTS_VOICE              = ""       # ex: "Kore" pour test; voir la doc Gemini TTS pour les voix FR
+GEMINI_TTS_VOICE              = ""       # ex: "Kore"; docs voix: https://ai.google.dev/gemini-api/docs/speech
 GEMINI_TTS_AUDIO_MIME         = "audio/wav"
 GEMINI_TTS_REQUEST_TIMEOUT_S  = 20
-# Endpoint v1beta (API Gemini susceptible d'évoluer).
+# Endpoint v1beta (API Gemini susceptible d'évoluer → prévoir migration v1).
 GEMINI_TTS_ENDPOINT           = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
@@ -305,10 +305,11 @@ class VoiceAssistant(threading.Thread):
     def _lire_audio(self, audio_bytes: bytes, timeout: int) -> bool:
         try:
             try:
-                sound = pygame.mixer.Sound(buffer=audio_bytes)
-            except TypeError:
-                # Compatibilité pygame 1.x: pas de support de buffer=.
-                sound = pygame.mixer.Sound(file=io.BytesIO(audio_bytes))
+                if pygame.version.vernum and pygame.version.vernum < (2, 0, 0):
+                    # Compatibilité pygame 1.x: pas de support de buffer=.
+                    sound = pygame.mixer.Sound(file=io.BytesIO(audio_bytes))
+                else:
+                    sound = pygame.mixer.Sound(buffer=audio_bytes)
             except pygame.error as e:
                 print(f"[VOCAL] Erreur lecture audio : {e}")
                 return False
@@ -320,7 +321,7 @@ class VoiceAssistant(threading.Thread):
                 if time.time() - start > timeout:
                     self._channel.stop()
                     return False
-                time.sleep(0.05)
+                time.sleep(0.1)
             return True
         except pygame.error as e:
             print(f"[VOCAL] Erreur lecture audio : {e}")

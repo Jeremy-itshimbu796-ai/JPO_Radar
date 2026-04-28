@@ -3,20 +3,27 @@ Interface Radar - Style militaire + Assistant Vocal Professionnel
 Compatible Arduino (port série) ou mode démo
 
 Dépendances :
-    pip install pygame pyserial
-    (aucune dépendance pour la voix — PowerShell SAPI natif Windows)
+     pip install pygame pyserial
+     (voix Gemini TTS via API — définir GEMINI_API_KEY)
 
 Lancer : python interface.py
 """
 
-import pygame
+import base64
+import io
+import json
 import math
+import os
+import queue
 import random
-import time
 import sys
 import threading
-import queue
-import subprocess
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import pygame
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║                        CONFIG                           ║
@@ -60,10 +67,12 @@ COOLDOWN_VOCAL_S = 6.0        # secondes min entre deux alertes par secteur
 NB_SECTEURS      = 8
 MAX_LOGS         = 6
 
-# ── Voix Windows (Microsoft Hortense = voix FR native) ────
-NOM_VOIX   = "Microsoft Hortense Desktop French"
-DEBIT_VOIX = -1               # −10 (lent) à +10 (rapide) ; −1 = légèrement lent, très clair
-VOLUME_VOIX = 100
+# ── Gemini TTS ──────────────────────────────────────────────
+GEMINI_API_KEY_ENV            = "GEMINI_API_KEY"
+GEMINI_TTS_MODEL              = "gemini-2.5-flash-preview-tts"
+GEMINI_TTS_VOICE              = ""       # définir un nom de voix Gemini (ex: voix FR) si besoin
+GEMINI_TTS_AUDIO_MIME         = "audio/wav"
+GEMINI_TTS_REQUEST_TIMEOUT_S  = 20
 
 # ── Mode ──────────────────────────────────────────────────
 MODE       = "demo"           # "demo" ou "arduino"
@@ -72,12 +81,12 @@ BAUD_RATE  = 9600
 
 
 # ╔══════════════════════════════════════════════════════════╗
-# ║        ASSISTANT VOCAL — PowerShell SAPI Windows        ║
+# ║        ASSISTANT VOCAL — Gemini TTS API                 ║
 # ║                                                         ║
-# ║  • Aucune dépendance Python supplémentaire              ║
-# ║  • Impossible de crasher (chaque phrase = nouveau proc) ║
+# ║  • Nécessite une clé GEMINI_API_KEY                     ║
 # ║  • Messages militaires professionnels et variés         ║
 # ║  • Pause du radar pendant la lecture                    ║
+# ║  • Repli silencieux si l'API est indisponible            ║
 # ╚══════════════════════════════════════════════════════════╝
 
 class VoiceAssistant(threading.Thread):
@@ -106,8 +115,13 @@ class VoiceAssistant(threading.Thread):
         self._actif     = True
         self._pret      = threading.Event()
         self._ok        = False
-        self._proc      = None
         self._cooldowns : dict[int, float] = {}
+        self._api_key   = os.getenv(GEMINI_API_KEY_ENV, "")
+        self._model     = os.getenv("GEMINI_TTS_MODEL", GEMINI_TTS_MODEL)
+        self._voice     = os.getenv("GEMINI_TTS_VOICE", GEMINI_TTS_VOICE)
+        self._mime      = os.getenv("GEMINI_TTS_AUDIO_MIME", GEMINI_TTS_AUDIO_MIME)
+        self._audio_ok  = False
+        self._channel   = None
 
     # ── Propriété publique ────────────────────────────────
 
@@ -134,18 +148,30 @@ class VoiceAssistant(threading.Thread):
 
     def stop(self):
         self._actif = False
+        if self._channel:
+            self._channel.stop()
         self._queue.put(("__EXTINCTION__", self._MSG_EXTINCTION))
 
     # ── Corps du thread ───────────────────────────────────
 
     def run(self):
+        if not self._api_key:
+            print("[VOCAL] ❌ GEMINI_API_KEY manquant — radar sans son.")
+            self._pret.set()
+            return
+
+        if not self._init_audio():
+            print("[VOCAL] ❌ Audio indisponible — radar sans son.")
+            self._pret.set()
+            return
+
         # Test d'initialisation
         ok = self._tts(self._MSG_DEMARRAGE, timeout=15)
         self._ok = ok
         self._pret.set()
 
         if not ok:
-            print("[VOCAL] ❌ PowerShell SAPI indisponible — radar sans son.")
+            print("[VOCAL] ❌ Gemini TTS indisponible — radar sans son.")
             return
 
         print("[VOCAL] ✔ Assistant vocal prêt")
@@ -163,46 +189,119 @@ class VoiceAssistant(threading.Thread):
             print(f"[VOCAL] >> {item}")
             self._tts(item, timeout=15)
 
-    # ── Moteur TTS : PowerShell SAPI ─────────────────────
+    # ── Moteur TTS : Gemini API ─────────────────────────
 
     def _tts(self, texte: str, timeout: int = 15) -> bool:
         """
-        Lit `texte` via PowerShell SAPI.
+        Lit `texte` via Gemini TTS.
         Retourne True si la lecture s'est bien déroulée.
         """
-        # Échapper les caractères spéciaux PowerShell
-        safe = (texte
-                .replace("\\", "\\\\")
-                .replace('"',  '`"')
-                .replace("'",  "''"))
+        if not self._api_key:
+            return False
 
-        # Sélection de la voix par mot-clé (insensible aux tirets/espaces)
-        script = (
-            "Add-Type -AssemblyName System.Speech; "
-            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            "$voix = $s.GetInstalledVoices() | "
-            "  Where-Object { $_.VoiceInfo.Name -like '*Hortense*' } | "
-            "  Select-Object -First 1; "
-            "if ($voix) { $s.SelectVoice($voix.VoiceInfo.Name) }; "
-            f"$s.Rate = {DEBIT_VOIX}; "
-            f"$s.Volume = {VOLUME_VOIX}; "
-            f'$s.Speak("{safe}")'
+        if not self._init_audio():
+            return False
+
+        audio = self._requete_tts(texte, timeout=GEMINI_TTS_REQUEST_TIMEOUT_S)
+        if not audio:
+            return False
+        return self._lire_audio(audio, timeout=timeout)
+
+    def _init_audio(self) -> bool:
+        if self._audio_ok:
+            return True
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+            self._audio_ok = True
+            return True
+        except pygame.error as e:
+            print(f"[VOCAL] Erreur audio pygame : {e}")
+            return False
+
+    def _requete_tts(self, texte: str, timeout: int) -> bytes | None:
+        payload = {
+            "contents": [
+                {"role": "user", "parts": [{"text": texte}]},
+            ],
+            "generationConfig": {
+                "responseMimeType": self._mime,
+            },
+        }
+        if self._voice:
+            payload["generationConfig"]["speechConfig"] = {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {
+                        "voiceName": self._voice,
+                    }
+                }
+            }
+
+        url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        query = urllib.parse.urlencode({"key": self._api_key})
+        request = urllib.request.Request(
+            f"{url.format(model=self._model)}?{query}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
         )
 
         try:
-            self._proc = subprocess.Popen(
-                ["powershell", "-WindowStyle", "Hidden",
-                 "-NonInteractive", "-Command", script],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self._proc.wait(timeout=timeout)
-            return self._proc.returncode == 0
-        except subprocess.TimeoutExpired:
-            self._proc.terminate()
-            return False
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                response_json = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read().decode("utf-8")
+            except Exception:
+                detail = str(e)
+            print(f"[VOCAL] Erreur Gemini TTS HTTP : {detail}")
+            return None
+        except urllib.error.URLError as e:
+            print(f"[VOCAL] Erreur Gemini TTS réseau : {e}")
+            return None
         except Exception as e:
-            print(f"[VOCAL] Erreur PowerShell : {e}")
+            print(f"[VOCAL] Erreur Gemini TTS : {e}")
+            return None
+
+        audio = self._extraire_audio(response_json)
+        if not audio:
+            error_msg = response_json.get("error", {}).get("message")
+            if error_msg:
+                print(f"[VOCAL] Réponse Gemini TTS invalide : {error_msg}")
+            else:
+                print("[VOCAL] Réponse Gemini TTS sans audio.")
+        return audio
+
+    @staticmethod
+    def _extraire_audio(response_json: dict) -> bytes | None:
+        for candidate in response_json.get("candidates", []):
+            content = candidate.get("content", {})
+            for part in content.get("parts", []):
+                inline = part.get("inlineData") or part.get("inline_data")
+                if inline and "data" in inline:
+                    try:
+                        return base64.b64decode(inline["data"])
+                    except Exception:
+                        return None
+        return None
+
+    def _lire_audio(self, audio_bytes: bytes, timeout: int) -> bool:
+        try:
+            try:
+                sound = pygame.mixer.Sound(buffer=audio_bytes)
+            except pygame.error:
+                sound = pygame.mixer.Sound(file=io.BytesIO(audio_bytes))
+            self._channel = sound.play()
+            if not self._channel:
+                return False
+            start = time.time()
+            while self._channel.get_busy():
+                if time.time() - start > timeout:
+                    self._channel.stop()
+                    return False
+                time.sleep(0.05)
+            return True
+        except pygame.error as e:
+            print(f"[VOCAL] Erreur lecture audio : {e}")
             return False
 
     # ── Direction cardinale ───────────────────────────────

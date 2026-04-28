@@ -10,6 +10,7 @@ Lancer : python interface.py
 """
 
 import base64
+import binascii
 import io
 import json
 import math
@@ -68,6 +69,9 @@ MAX_LOGS         = 6
 
 # ── Gemini TTS ──────────────────────────────────────────────
 GEMINI_API_KEY_ENV            = "GEMINI_API_KEY"
+GEMINI_TTS_MODEL_ENV          = "GEMINI_TTS_MODEL"
+GEMINI_TTS_VOICE_ENV          = "GEMINI_TTS_VOICE"
+GEMINI_TTS_AUDIO_MIME_ENV     = "GEMINI_TTS_AUDIO_MIME"
 GEMINI_TTS_MODEL              = "gemini-2.5-flash-preview-tts"
 GEMINI_TTS_VOICE              = ""       # ex: "Kore" pour test; choisir une voix FR disponible
 GEMINI_TTS_AUDIO_MIME         = "audio/wav"
@@ -120,9 +124,9 @@ class VoiceAssistant(threading.Thread):
         self._ok        = False
         self._cooldowns : dict[int, float] = {}
         self._api_key   = os.getenv(GEMINI_API_KEY_ENV, "")
-        self._model     = os.getenv("GEMINI_TTS_MODEL", GEMINI_TTS_MODEL)
-        self._voice     = os.getenv("GEMINI_TTS_VOICE", GEMINI_TTS_VOICE)
-        self._mime      = os.getenv("GEMINI_TTS_AUDIO_MIME", GEMINI_TTS_AUDIO_MIME)
+        self._model     = os.getenv(GEMINI_TTS_MODEL_ENV, GEMINI_TTS_MODEL)
+        self._voice     = os.getenv(GEMINI_TTS_VOICE_ENV, GEMINI_TTS_VOICE)
+        self._mime      = os.getenv(GEMINI_TTS_AUDIO_MIME_ENV, GEMINI_TTS_AUDIO_MIME)
         self._audio_ok  = False
         self._channel   = None
 
@@ -251,7 +255,12 @@ class VoiceAssistant(threading.Thread):
 
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                response_json = json.loads(response.read().decode("utf-8"))
+                raw = response.read().decode("utf-8")
+            try:
+                response_json = json.loads(raw)
+            except json.JSONDecodeError as e:
+                print(f"[VOCAL] Réponse Gemini TTS illisible : {e}")
+                return None
         except urllib.error.HTTPError as e:
             try:
                 detail = e.read().decode("utf-8")
@@ -280,12 +289,13 @@ class VoiceAssistant(threading.Thread):
         for candidate in response_json.get("candidates", []):
             content = candidate.get("content", {})
             for part in content.get("parts", []):
-                # Compatibilité: certaines réponses utilisent inlineData, d'autres inline_data.
+                # Compatibilité: REST (inlineData) vs SDK (inline_data).
                 inline = part.get("inlineData") or part.get("inline_data")
                 if inline and "data" in inline:
                     try:
                         return base64.b64decode(inline["data"])
-                    except Exception:
+                    except (binascii.Error, ValueError) as e:
+                        print(f"[VOCAL] Audio base64 invalide : {e}")
                         return None
         return None
 
@@ -294,7 +304,7 @@ class VoiceAssistant(threading.Thread):
             try:
                 sound = pygame.mixer.Sound(buffer=audio_bytes)
             except pygame.error:
-                # Anciennes versions de pygame attendent un fichier-like.
+                # Compatibilité pygame 1.x: pas de support de buffer=.
                 sound = pygame.mixer.Sound(file=io.BytesIO(audio_bytes))
             self._channel = sound.play()
             if not self._channel:

@@ -76,7 +76,7 @@ GEMINI_TTS_ENDPOINT_ENV       = "GEMINI_TTS_ENDPOINT"
 GEMINI_TTS_MODEL              = "gemini-2.5-flash-preview-tts"
 GEMINI_TTS_VOICE              = ""       # ex: "Kore"; docs voix: https://ai.google.dev/gemini-api/docs/speech
 GEMINI_TTS_AUDIO_MIME         = "audio/wav"
-GEMINI_TTS_REQUEST_TIMEOUT_S  = 20
+GEMINI_TTS_REQUEST_TIMEOUT_SECONDS = 20
 # Endpoint v1beta (API Gemini susceptible d'évoluer → prévoir migration v1).
 GEMINI_TTS_ENDPOINT           = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -212,7 +212,7 @@ class VoiceAssistant(threading.Thread):
         if not self._init_audio():
             return False
 
-        audio = self._requete_tts(texte, timeout=GEMINI_TTS_REQUEST_TIMEOUT_S)
+        audio = self._requete_tts(texte, timeout=GEMINI_TTS_REQUEST_TIMEOUT_SECONDS)
         if not audio:
             return False
         return self._lire_audio(audio, timeout=timeout)
@@ -238,14 +238,9 @@ class VoiceAssistant(threading.Thread):
                 "responseMimeType": self._mime,
             },
         }
-        if self._voice:
-            payload["generationConfig"]["speechConfig"] = {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {
-                        "voiceName": self._voice,
-                    }
-                }
-            }
+        voice_config = self._build_voice_config()
+        if voice_config:
+            payload["generationConfig"]["speechConfig"] = voice_config
 
         request = urllib.request.Request(
             self._endpoint.format(model=self._model),
@@ -292,7 +287,7 @@ class VoiceAssistant(threading.Thread):
         for candidate in response_json.get("candidates", []):
             content = candidate.get("content", {})
             for part in content.get("parts", []):
-                # Compatibilité: REST (inlineData) vs SDK (inline_data).
+                # Compatibilité: REST (inlineData) vs wrappers SDK (inline_data).
                 inline = part.get("inlineData") or part.get("inline_data")
                 if inline and "data" in inline:
                     try:
@@ -302,17 +297,32 @@ class VoiceAssistant(threading.Thread):
                         return None
         return None
 
+    def _build_voice_config(self) -> dict | None:
+        if not self._voice:
+            return None
+        return {
+            "voiceConfig": {
+                "prebuiltVoiceConfig": {
+                    "voiceName": self._voice,
+                }
+            }
+        }
+
     def _lire_audio(self, audio_bytes: bytes, timeout: int) -> bool:
         try:
-            try:
-                if pygame.version.vernum and pygame.version.vernum < (2, 0, 0):
-                    # Compatibilité pygame 1.x: pas de support de buffer=.
-                    sound = pygame.mixer.Sound(file=io.BytesIO(audio_bytes))
-                else:
+            vernum = getattr(pygame.version, "vernum", None)
+            major = vernum[0] if isinstance(vernum, tuple) and vernum else None
+            if major is not None and major < 2:
+                # Compatibilité pygame 1.x: pas de support de buffer=.
+                sound = pygame.mixer.Sound(file=io.BytesIO(audio_bytes))
+            else:
+                try:
                     sound = pygame.mixer.Sound(buffer=audio_bytes)
-            except pygame.error as e:
-                print(f"[VOCAL] Erreur lecture audio : {e}")
-                return False
+                except TypeError:
+                    sound = pygame.mixer.Sound(file=io.BytesIO(audio_bytes))
+        except pygame.error as e:
+            print(f"[VOCAL] Erreur lecture audio : {e}")
+            return False
             self._channel = sound.play()
             if not self._channel:
                 return False

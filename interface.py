@@ -69,9 +69,13 @@ MAX_LOGS         = 6
 # ── Gemini TTS ──────────────────────────────────────────────
 GEMINI_API_KEY_ENV            = "GEMINI_API_KEY"
 GEMINI_TTS_MODEL              = "gemini-2.5-flash-preview-tts"
-GEMINI_TTS_VOICE              = ""       # ex: "Kore" (remplacer par une voix FR disponible)
+GEMINI_TTS_VOICE              = ""       # ex: "Kore" pour test; choisir une voix FR disponible
 GEMINI_TTS_AUDIO_MIME         = "audio/wav"
 GEMINI_TTS_REQUEST_TIMEOUT_S  = 20
+# Endpoint v1beta (API Gemini susceptible d'évoluer).
+GEMINI_TTS_ENDPOINT           = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
 
 # ── Mode ──────────────────────────────────────────────────
 MODE       = "demo"           # "demo" ou "arduino"
@@ -201,15 +205,10 @@ class VoiceAssistant(threading.Thread):
         if not self._init_audio():
             return False
 
-        request_timeout = min(GEMINI_TTS_REQUEST_TIMEOUT_S, timeout)
-        start = time.time()
-        audio = self._requete_tts(texte, timeout=request_timeout)
+        audio = self._requete_tts(texte, timeout=GEMINI_TTS_REQUEST_TIMEOUT_S)
         if not audio:
             return False
-        remaining = timeout - (time.time() - start)
-        if remaining <= 0:
-            return False
-        return self._lire_audio(audio, timeout=remaining)
+        return self._lire_audio(audio, timeout=timeout)
 
     def _init_audio(self) -> bool:
         if self._audio_ok:
@@ -241,9 +240,8 @@ class VoiceAssistant(threading.Thread):
                 }
             }
 
-        url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         request = urllib.request.Request(
-            url.format(model=self._model),
+            GEMINI_TTS_ENDPOINT.format(model=self._model),
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
@@ -282,6 +280,7 @@ class VoiceAssistant(threading.Thread):
         for candidate in response_json.get("candidates", []):
             content = candidate.get("content", {})
             for part in content.get("parts", []):
+                # Compatibilité: certaines réponses utilisent inlineData, d'autres inline_data.
                 inline = part.get("inlineData") or part.get("inline_data")
                 if inline and "data" in inline:
                     try:
@@ -295,6 +294,7 @@ class VoiceAssistant(threading.Thread):
             try:
                 sound = pygame.mixer.Sound(buffer=audio_bytes)
             except pygame.error:
+                # Anciennes versions de pygame attendent un fichier-like.
                 sound = pygame.mixer.Sound(file=io.BytesIO(audio_bytes))
             self._channel = sound.play()
             if not self._channel:

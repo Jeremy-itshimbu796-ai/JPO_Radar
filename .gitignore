@@ -7,3 +7,4 @@ test_tts.py
 test_audio.py
 __pycache__/
 *.pyc
+*.gitignore

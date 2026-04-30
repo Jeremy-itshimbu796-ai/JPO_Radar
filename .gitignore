@@ -1,0 +1,9 @@
+.env
+env/
+TP/
+*.codex
+test_tts.wav
+test_tts.py
+test_audio.py
+__pycache__/
+*.pyc

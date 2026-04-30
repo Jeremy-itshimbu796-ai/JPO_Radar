@@ -4,7 +4,7 @@ Compatible Arduino (port série) ou mode démo
 
 Dépendances :
      pip install pygame pyserial
-     (voix Gemini TTS via API — définir GEMINI_API_KEY)
+     (voix Gemini TTS via API - definir GEMINI_API_KEY dans .env ou l'environnement)
 
 Lancer : python interface.py
 """
@@ -21,7 +21,9 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import wave
 
 import pygame
 
@@ -71,12 +73,14 @@ MAX_LOGS         = 6
 GEMINI_API_KEY_ENV            = "GEMINI_API_KEY"
 GEMINI_TTS_MODEL_ENV          = "GEMINI_TTS_MODEL"
 GEMINI_TTS_VOICE_ENV          = "GEMINI_TTS_VOICE"
-GEMINI_TTS_AUDIO_MIME_ENV     = "GEMINI_TTS_AUDIO_MIME"
 GEMINI_TTS_ENDPOINT_ENV       = "GEMINI_TTS_ENDPOINT"
-GEMINI_TTS_MODEL              = "gemini-2.5-flash-preview-tts"
-GEMINI_TTS_VOICE              = ""       # ex: "Kore"; docs voix: https://ai.google.dev/gemini-api/docs/speech
-GEMINI_TTS_AUDIO_MIME         = "audio/wav"
+GEMINI_TTS_MODEL              = "gemini-3.1-flash-tts-preview"
+GEMINI_TTS_VOICE              = "Kore"       # ex: "Kore"; docs voix: https://ai.google.dev/gemini-api/docs/speech
 GEMINI_TTS_REQUEST_TIMEOUT_SECONDS = 20
+GEMINI_TTS_SAMPLE_RATE        = 24000
+GEMINI_TTS_CHANNELS           = 1
+GEMINI_TTS_SAMPLE_WIDTH       = 2
+SIGNAL_LOCAL_SAMPLE_RATE      = 24000
 # Endpoint v1beta (API Gemini susceptible d'évoluer → prévoir migration v1).
 GEMINI_TTS_ENDPOINT           = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -86,6 +90,30 @@ GEMINI_TTS_ENDPOINT           = (
 MODE       = "demo"           # "demo" ou "arduino"
 PORT_SERIE = "COM3"
 BAUD_RATE  = 9600
+
+
+def charger_env_local():
+    """Charge JPO_Radar/.env sans dépendance externe, sans écraser l'environnement."""
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.exists(env_path):
+        return
+
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError as e:
+        print(f"[ENV] Impossible de lire .env : {e}")
+
+
+charger_env_local()
 
 
 # ╔══════════════════════════════════════════════════════════╗
@@ -127,9 +155,9 @@ class VoiceAssistant(threading.Thread):
         self._api_key   = os.getenv(GEMINI_API_KEY_ENV, "")
         self._model     = os.getenv(GEMINI_TTS_MODEL_ENV, GEMINI_TTS_MODEL)
         self._voice     = os.getenv(GEMINI_TTS_VOICE_ENV, GEMINI_TTS_VOICE)
-        self._mime      = os.getenv(GEMINI_TTS_AUDIO_MIME_ENV, GEMINI_TTS_AUDIO_MIME)
         self._endpoint  = os.getenv(GEMINI_TTS_ENDPOINT_ENV, GEMINI_TTS_ENDPOINT)
         self._audio_ok  = False
+        self._gemini_ok = False
         self._channel   = None
 
     # ── Propriété publique ────────────────────────────────
@@ -184,7 +212,8 @@ class VoiceAssistant(threading.Thread):
             print("[VOCAL] ❌ Gemini TTS indisponible — radar sans son.")
             return
 
-        print("[VOCAL] ✔ Assistant vocal prêt")
+        mode_audio = "Gemini TTS" if self._gemini_ok else "signal local"
+        print(f"[VOCAL] ✔ Assistant vocal prêt ({mode_audio})")
 
         while self._actif:
             item = self._queue.get()
@@ -206,15 +235,18 @@ class VoiceAssistant(threading.Thread):
         Lit `texte` via Gemini TTS.
         Retourne True si la lecture s'est bien déroulée.
         """
-        if not self._api_key:
-            return False
-
         if not self._init_audio():
             return False
 
+        if not self._api_key:
+            print("[VOCAL] GEMINI_API_KEY manquant — signal local uniquement.")
+            return self._lire_signal_local(timeout=timeout)
+
         audio = self._requete_tts(texte, timeout=GEMINI_TTS_REQUEST_TIMEOUT_SECONDS)
         if not audio:
-            return False
+            print("[VOCAL] Gemini TTS indisponible — signal local de repli.")
+            return self._lire_signal_local(timeout=timeout)
+        self._gemini_ok = True
         return self._lire_audio(audio, timeout=timeout)
 
     def _init_audio(self) -> bool:
@@ -235,15 +267,19 @@ class VoiceAssistant(threading.Thread):
                 {"role": "user", "parts": [{"text": texte}]},
             ],
             "generationConfig": {
-                "responseMimeType": self._mime,
+                "responseModalities": ["AUDIO"],
             },
+            "model": self._model,
         }
         voice_config = self._build_voice_config()
         if voice_config:
             payload["generationConfig"]["speechConfig"] = voice_config
 
+        url = self._endpoint.format(model=self._model)
+        url = f"{url}?{urllib.parse.urlencode({'key': self._api_key})}"
+
         request = urllib.request.Request(
-            self._endpoint.format(model=self._model),
+            url,
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
@@ -309,33 +345,65 @@ class VoiceAssistant(threading.Thread):
         }
 
     def _lire_audio(self, audio_bytes: bytes, timeout: int) -> bool:
+        wav_bytes = self._normaliser_audio_pour_pygame(audio_bytes)
+        return self._lire_wav(wav_bytes, timeout=timeout)
+
+    def _lire_signal_local(self, timeout: int) -> bool:
+        wav_bytes = self._generer_signal_local_wav()
+        return self._lire_wav(wav_bytes, timeout=timeout)
+
+    def _lire_wav(self, wav_bytes: bytes, timeout: int) -> bool:
         try:
-            vernum = getattr(pygame.version, "vernum", None)
-            major = vernum[0] if isinstance(vernum, tuple) and vernum else None
-            if major is not None and major < 2:
-                # Compatibilité pygame 1.x: pas de support de buffer=.
-                sound = pygame.mixer.Sound(file=io.BytesIO(audio_bytes))
-            else:
-                try:
-                    sound = pygame.mixer.Sound(buffer=audio_bytes)
-                except TypeError:
-                    sound = pygame.mixer.Sound(file=io.BytesIO(audio_bytes))
+            sound = pygame.mixer.Sound(file=io.BytesIO(wav_bytes))
         except pygame.error as e:
             print(f"[VOCAL] Erreur lecture audio : {e}")
             return False
-            self._channel = sound.play()
-            if not self._channel:
+
+        self._channel = sound.play()
+        if not self._channel:
+            return False
+        start = time.time()
+        while self._channel and self._channel.get_busy():
+            if time.time() - start > timeout:
+                self._channel.stop()
                 return False
-            start = time.time()
-            while self._channel and self._channel.get_busy():
-                if time.time() - start > timeout:
-                    self._channel.stop()
-                    return False
-                time.sleep(0.1)
-            return True
-        except pygame.error as e:
-            print(f"[VOCAL] Erreur lecture audio : {e}")
-            return False
+            time.sleep(0.1)
+        return True
+
+    @staticmethod
+    def _normaliser_audio_pour_pygame(audio_bytes: bytes) -> bytes:
+        """Gemini TTS renvoie du PCM 24 kHz mono 16-bit; pygame préfère un WAV."""
+        if audio_bytes[:4] == b"RIFF":
+            return audio_bytes
+
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav:
+            wav.setnchannels(GEMINI_TTS_CHANNELS)
+            wav.setsampwidth(GEMINI_TTS_SAMPLE_WIDTH)
+            wav.setframerate(GEMINI_TTS_SAMPLE_RATE)
+            wav.writeframes(audio_bytes)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _generer_signal_local_wav() -> bytes:
+        frames = bytearray()
+        for frequence, duree_s in ((880, 0.14), (0, 0.06), (660, 0.22)):
+            nb_samples = int(SIGNAL_LOCAL_SAMPLE_RATE * duree_s)
+            for i in range(nb_samples):
+                if frequence == 0:
+                    sample = 0
+                else:
+                    envelope = min(1.0, i / 300, (nb_samples - i) / 300)
+                    sample = int(14000 * envelope * math.sin(2 * math.pi * frequence * i / SIGNAL_LOCAL_SAMPLE_RATE))
+                frames.extend(sample.to_bytes(2, byteorder="little", signed=True))
+
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(SIGNAL_LOCAL_SAMPLE_RATE)
+            wav.writeframes(bytes(frames))
+        return buffer.getvalue()
 
     # ── Direction cardinale ───────────────────────────────
 

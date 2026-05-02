@@ -3,16 +3,14 @@ Interface Radar - Style militaire + Assistant Vocal Professionnel
 Compatible Arduino (port série) ou mode démo
 
 Dépendances :
-     pip install pygame pyserial
-     (voix Gemini TTS via API - definir GEMINI_API_KEY dans .env ou l'environnement)
+     pip install pygame pyserial google-genai
+     (voix Gemini Live API - definir GEMINI_API_KEY dans .env ou l'environnement)
 
 Lancer : python interface.py
 """
 
-import base64
-import binascii
+import asyncio
 import io
-import json
 import math
 import os
 import queue
@@ -20,12 +18,14 @@ import random
 import sys
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import wave
 
 import pygame
+
+try:
+    from google import genai
+except ImportError:
+    genai = None
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║                        CONFIG                           ║
@@ -61,29 +61,26 @@ VITESSE_DEG     = 1.5
 LONGUEUR_TRAINE = 90
 DUREE_POINT     = 5.0
 
-# ── Pause radar sur détection ──────────────────────────────
-DUREE_PAUSE_S   = 3.5         # secondes d'arrêt après détection
-
 # ── Assistant vocal ────────────────────────────────────────
 COOLDOWN_VOCAL_S = 6.0        # secondes min entre deux alertes par secteur
 NB_SECTEURS      = 8
 MAX_LOGS         = 6
 
-# ── Gemini TTS ──────────────────────────────────────────────
+# ── Gemini Live API ──────────────────────────────────────────
 GEMINI_API_KEY_ENV            = "GEMINI_API_KEY"
-GEMINI_TTS_MODEL_ENV          = "GEMINI_TTS_MODEL"
-GEMINI_TTS_VOICE_ENV          = "GEMINI_TTS_VOICE"
-GEMINI_TTS_ENDPOINT_ENV       = "GEMINI_TTS_ENDPOINT"
-GEMINI_TTS_MODEL              = "gemini-3.1-flash-tts-preview"
-GEMINI_TTS_VOICE              = "Kore"       # ex: "Kore"; docs voix: https://ai.google.dev/gemini-api/docs/speech
-GEMINI_TTS_REQUEST_TIMEOUT_SECONDS = 20
-GEMINI_TTS_SAMPLE_RATE        = 24000
-GEMINI_TTS_CHANNELS           = 1
-GEMINI_TTS_SAMPLE_WIDTH       = 2
+GEMINI_LIVE_MODEL_ENV         = "GEMINI_LIVE_MODEL"
+GEMINI_LIVE_VOICE_ENV         = "GEMINI_LIVE_VOICE"
+GEMINI_LIVE_MODEL             = "gemini-2.5-flash-native-audio-preview-12-2025"
+GEMINI_LIVE_VOICE             = "Kore"      
+GEMINI_LIVE_SAMPLE_RATE       = 24000
+GEMINI_LIVE_CHANNELS          = 1
+GEMINI_LIVE_SAMPLE_WIDTH      = 2
 SIGNAL_LOCAL_SAMPLE_RATE      = 24000
-# Endpoint v1beta (API Gemini susceptible d'évoluer → prévoir migration v1).
-GEMINI_TTS_ENDPOINT           = (
-    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_LIVE_SYSTEM_INSTRUCTION = (
+    "Tu es l'assistant vocal d'un radar de demonstration. "
+    "Reponds en francais, avec une voix courte, claire et professionnelle. "
+    "Au demarrage, presente le systeme en une phrase puis annonce que la surveillance commence. "
+    "Pour chaque contact radar, annonce uniquement le secteur et la distance, sans poser de question."
 )
 
 # ── Mode ──────────────────────────────────────────────────
@@ -116,14 +113,7 @@ def charger_env_local():
 charger_env_local()
 
 
-# ╔══════════════════════════════════════════════════════════╗
-# ║        ASSISTANT VOCAL — Gemini TTS API                 ║
-# ║                                                         ║
-# ║  • Nécessite une clé GEMINI_API_KEY                     ║
-# ║  • Messages militaires professionnels et variés         ║
-# ║  • Pause du radar pendant la lecture                    ║
-# ║  • Repli silencieux si l'API est indisponible            ║
-# ╚══════════════════════════════════════════════════════════╝
+
 
 class VoiceAssistant(threading.Thread):
 
@@ -150,14 +140,15 @@ class VoiceAssistant(threading.Thread):
         self._queue     : queue.Queue = queue.Queue()
         self._actif     = True
         self._pret      = threading.Event()
+        self._en_lecture = threading.Event()
+        self._occupe    = threading.Event()
         self._ok        = False
         self._cooldowns : dict[int, float] = {}
         self._api_key   = os.getenv(GEMINI_API_KEY_ENV, "")
-        self._model     = os.getenv(GEMINI_TTS_MODEL_ENV, GEMINI_TTS_MODEL)
-        self._voice     = os.getenv(GEMINI_TTS_VOICE_ENV, GEMINI_TTS_VOICE)
-        self._endpoint  = os.getenv(GEMINI_TTS_ENDPOINT_ENV, GEMINI_TTS_ENDPOINT)
+        self._model     = os.getenv(GEMINI_LIVE_MODEL_ENV, GEMINI_LIVE_MODEL)
+        self._voice     = os.getenv(GEMINI_LIVE_VOICE_ENV, GEMINI_LIVE_VOICE)
         self._audio_ok  = False
-        self._gemini_ok = False
+        self._live_ok   = False
         self._channel   = None
 
     # ── Propriété publique ────────────────────────────────
@@ -165,6 +156,14 @@ class VoiceAssistant(threading.Thread):
     @property
     def pret(self) -> bool:
         return self._ok
+
+    @property
+    def en_lecture(self) -> bool:
+        return self._en_lecture.is_set()
+
+    @property
+    def occupe(self) -> bool:
+        return self._occupe.is_set()
 
     # ── API publique ──────────────────────────────────────
 
@@ -181,6 +180,7 @@ class VoiceAssistant(threading.Thread):
         direction = self._angle_vers_direction(angle_deg)
         template  = random.choice(self._TEMPLATES)
         texte     = template.format(dir=direction, dist=dist_str)
+        self._occupe.set()
         self._queue.put(texte)
 
     def stop(self):
@@ -193,61 +193,117 @@ class VoiceAssistant(threading.Thread):
     # ── Corps du thread ───────────────────────────────────
 
     def run(self):
-        if not self._api_key:
-            print("[VOCAL] ❌ GEMINI_API_KEY manquant — radar sans son.")
-            self._pret.set()
-            return
-
         if not self._init_audio():
             print("[VOCAL] ❌ Audio indisponible — radar sans son.")
             self._pret.set()
             return
 
-        # Test d'initialisation
-        ok = self._tts(self._MSG_DEMARRAGE, timeout=15)
-        self._ok = ok
-        self._pret.set()
-
-        if not ok:
-            print("[VOCAL] ❌ Gemini TTS indisponible — radar sans son.")
+        if not self._api_key:
+            print("[VOCAL] ❌ GEMINI_API_KEY manquant — signal local uniquement.")
+            self._run_local()
             return
 
-        mode_audio = "Gemini TTS" if self._gemini_ok else "signal local"
-        print(f"[VOCAL] ✔ Assistant vocal prêt ({mode_audio})")
+        if genai is None:
+            print("[VOCAL] ❌ google-genai manquant — installer avec : pip install google-genai")
+            self._run_local()
+            return
+
+        try:
+            asyncio.run(self._run_live())
+        except Exception as e:
+            print(f"[VOCAL] ❌ Gemini Live indisponible : {e}")
+            self._run_local()
+
+    def _run_local(self):
+        self._ok = self._lire_signal_local(timeout=4)
+        self._pret.set()
+        print("[VOCAL] ✔ Assistant vocal prêt (signal local)")
 
         while self._actif:
             item = self._queue.get()
             if item is None:
                 break
-
-            # Tuple spécial pour l'extinction
             if isinstance(item, tuple) and item[0] == "__EXTINCTION__":
-                self._tts(item[1], timeout=8)
+                self._lire_signal_local(timeout=3)
                 break
-
             print(f"[VOCAL] >> {item}")
-            self._tts(item, timeout=15)
+            try:
+                self._lire_signal_local(timeout=3)
+            finally:
+                self._occupe.clear()
 
-    # ── Moteur TTS : Gemini API ─────────────────────────
+    # ── Moteur vocal : Gemini Live API ───────────────────
 
-    def _tts(self, texte: str, timeout: int = 15) -> bool:
-        """
-        Lit `texte` via Gemini TTS.
-        Retourne True si la lecture s'est bien déroulée.
-        """
-        if not self._init_audio():
-            return False
+    async def _run_live(self):
+        client = genai.Client(api_key=self._api_key)
+        config = {
+            "response_modalities": ["AUDIO"],
+            "system_instruction": GEMINI_LIVE_SYSTEM_INSTRUCTION,
+        }
+        voice_config = self._build_voice_config()
+        if voice_config:
+            config["speech_config"] = voice_config
 
-        if not self._api_key:
-            print("[VOCAL] GEMINI_API_KEY manquant — signal local uniquement.")
-            return self._lire_signal_local(timeout=timeout)
+        print("[VOCAL] Micro coupé — seuls les événements radar sont envoyés au modèle.")
+        async with client.aio.live.connect(model=self._model, config=config) as session:
+            self._live_ok = True
+            ok = await self._envoyer_et_lire(session, self._MSG_DEMARRAGE, timeout=20)
+            self._ok = ok
+            self._pret.set()
 
-        audio = self._requete_tts(texte, timeout=GEMINI_TTS_REQUEST_TIMEOUT_SECONDS)
-        if not audio:
-            print("[VOCAL] Gemini TTS indisponible — signal local de repli.")
-            return self._lire_signal_local(timeout=timeout)
-        self._gemini_ok = True
-        return self._lire_audio(audio, timeout=timeout)
+            if not ok:
+                print("[VOCAL] ❌ Gemini Live connecté, mais aucune voix reçue.")
+                return
+
+            print("[VOCAL] ✔ Assistant vocal prêt (Gemini Live)")
+            while self._actif:
+                item = await asyncio.to_thread(self._queue.get)
+                if item is None:
+                    break
+
+                if isinstance(item, tuple) and item[0] == "__EXTINCTION__":
+                    await self._envoyer_et_lire(session, item[1], timeout=10)
+                    break
+
+                print(f"[VOCAL] >> {item}")
+                try:
+                    await self._envoyer_et_lire(session, item, timeout=18)
+                finally:
+                    self._occupe.clear()
+
+    async def _envoyer_et_lire(self, session, texte: str, timeout: int) -> bool:
+        await session.send_client_content(
+            turns={"role": "user", "parts": [{"text": texte}]},
+            turn_complete=True,
+        )
+
+        chunks: list[bytes] = []
+        try:
+            async with asyncio.timeout(timeout):
+                async for response in session.receive():
+                    server_content = getattr(response, "server_content", None)
+                    if not server_content:
+                        continue
+                    if getattr(server_content, "interrupted", False):
+                        chunks.clear()
+                        break
+
+                    model_turn = getattr(server_content, "model_turn", None)
+                    parts = getattr(model_turn, "parts", []) if model_turn else []
+                    for part in parts:
+                        inline_data = getattr(part, "inline_data", None)
+                        data = getattr(inline_data, "data", None) if inline_data else None
+                        if isinstance(data, bytes):
+                            chunks.append(data)
+        except TimeoutError:
+            print("[VOCAL] Gemini Live trop lent — signal local.")
+
+        if not chunks:
+            print("[VOCAL] Gemini Live n'a renvoyé aucun audio — signal local.")
+            return await asyncio.to_thread(self._lire_signal_local, timeout)
+
+        audio = b"".join(chunks)
+        return await asyncio.to_thread(self._lire_audio, audio, timeout)
 
     def _init_audio(self) -> bool:
         if self._audio_ok:
@@ -261,85 +317,13 @@ class VoiceAssistant(threading.Thread):
             print(f"[VOCAL] Erreur audio pygame : {e}")
             return False
 
-    def _requete_tts(self, texte: str, timeout: int) -> bytes | None:
-        payload = {
-            "contents": [
-                {"role": "user", "parts": [{"text": texte}]},
-            ],
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-            },
-            "model": self._model,
-        }
-        voice_config = self._build_voice_config()
-        if voice_config:
-            payload["generationConfig"]["speechConfig"] = voice_config
-
-        url = self._endpoint.format(model=self._model)
-        url = f"{url}?{urllib.parse.urlencode({'key': self._api_key})}"
-
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": self._api_key,
-            },
-        )
-
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read().decode("utf-8")
-            try:
-                response_json = json.loads(raw)
-            except json.JSONDecodeError as e:
-                print(f"[VOCAL] Réponse Gemini TTS illisible : {e}")
-                return None
-        except urllib.error.HTTPError as e:
-            try:
-                detail = e.read().decode("utf-8")
-            except Exception:
-                detail = str(e)
-            print(f"[VOCAL] Erreur Gemini TTS HTTP : {detail}")
-            return None
-        except urllib.error.URLError as e:
-            print(f"[VOCAL] Erreur Gemini TTS réseau : {e}")
-            return None
-        except Exception as e:
-            print(f"[VOCAL] Erreur Gemini TTS : {e}")
-            return None
-
-        audio = self._extraire_audio(response_json)
-        if not audio:
-            error_msg = response_json.get("error", {}).get("message")
-            if error_msg:
-                print(f"[VOCAL] Erreur Gemini TTS API : {error_msg}")
-            else:
-                print("[VOCAL] Réponse Gemini TTS sans audio.")
-        return audio
-
-    @staticmethod
-    def _extraire_audio(response_json: dict) -> bytes | None:
-        for candidate in response_json.get("candidates", []):
-            content = candidate.get("content", {})
-            for part in content.get("parts", []):
-                # Compatibilité: REST (inlineData) vs wrappers SDK (inline_data).
-                inline = part.get("inlineData") or part.get("inline_data")
-                if inline and "data" in inline:
-                    try:
-                        return base64.b64decode(inline["data"])
-                    except (binascii.Error, ValueError) as e:
-                        print(f"[VOCAL] Audio base64 invalide : {e}")
-                        return None
-        return None
-
     def _build_voice_config(self) -> dict | None:
         if not self._voice:
             return None
         return {
-            "voiceConfig": {
-                "prebuiltVoiceConfig": {
-                    "voiceName": self._voice,
+            "voice_config": {
+                "prebuilt_voice_config": {
+                    "voice_name": self._voice,
                 }
             }
         }
@@ -359,28 +343,33 @@ class VoiceAssistant(threading.Thread):
             print(f"[VOCAL] Erreur lecture audio : {e}")
             return False
 
+        self._en_lecture.set()
         self._channel = sound.play()
         if not self._channel:
+            self._en_lecture.clear()
             return False
         start = time.time()
-        while self._channel and self._channel.get_busy():
-            if time.time() - start > timeout:
-                self._channel.stop()
-                return False
-            time.sleep(0.1)
-        return True
+        try:
+            while self._channel and self._channel.get_busy():
+                if time.time() - start > timeout:
+                    self._channel.stop()
+                    return False
+                time.sleep(0.1)
+            return True
+        finally:
+            self._en_lecture.clear()
 
     @staticmethod
     def _normaliser_audio_pour_pygame(audio_bytes: bytes) -> bytes:
-        """Gemini TTS renvoie du PCM 24 kHz mono 16-bit; pygame préfère un WAV."""
+        """Gemini Live renvoie du PCM 24 kHz mono 16-bit; pygame préfère un WAV."""
         if audio_bytes[:4] == b"RIFF":
             return audio_bytes
 
         buffer = io.BytesIO()
         with wave.open(buffer, "wb") as wav:
-            wav.setnchannels(GEMINI_TTS_CHANNELS)
-            wav.setsampwidth(GEMINI_TTS_SAMPLE_WIDTH)
-            wav.setframerate(GEMINI_TTS_SAMPLE_RATE)
+            wav.setnchannels(GEMINI_LIVE_CHANNELS)
+            wav.setsampwidth(GEMINI_LIVE_SAMPLE_WIDTH)
+            wav.setframerate(GEMINI_LIVE_SAMPLE_RATE)
             wav.writeframes(audio_bytes)
         return buffer.getvalue()
 
@@ -603,7 +592,10 @@ def dessiner_hud(
 
     # ── Bannière ANALYSE EN COURS pendant la pause ────────
     if en_pause:
-        msg  = f"ANALYSE EN COURS  —  reprise dans {tps_pause:.1f} s"
+        if tps_pause > 0:
+            msg = f"ANALYSE EN COURS  —  reprise dans {tps_pause:.1f} s"
+        else:
+            msg = "ANALYSE EN COURS  —  reprise apres annonce vocale"
         txt  = font_t.render(msg, True, ORANGE)
         tx   = CENTRE_X - txt.get_width() // 2
         ty   = CENTRE_Y + RAYON + 12
@@ -668,8 +660,8 @@ def main():
     print("[VOCAL] Démarrage de l'assistant vocal...")
     assistant = VoiceAssistant()
     assistant.start()
-    # Le message de démarrage + init prend quelques secondes
-    assistant._pret.wait(timeout=12.0)
+    
+    assistant._pret.wait(timeout=30.0)
     if assistant.pret:
         print("[VOCAL] ✔ Assistant vocal opérationnel")
     else:
@@ -689,7 +681,7 @@ def main():
     log           = DetectionLog()
     flash         = AlerteFlash()
     angle_actuel  = 0.0
-    pause_jusqu_a = 0.0   # timestamp fin de pause (0 = radar tourne)
+    pause_jusqu_a = 0.0   
 
     print("[RADAR] Démarré — ESC ou fermer la fenêtre pour quitter.")
 
@@ -705,7 +697,7 @@ def main():
                 running = False
 
         now      = time.time()
-        en_pause = now < pause_jusqu_a
+        en_pause = assistant.occupe
 
         # Rotation seulement hors pause
         if not en_pause:
@@ -722,8 +714,7 @@ def main():
             points.append(PointDetecte(a, d))
             log.ajouter(a, d)
             flash.declencher()
-            pause_jusqu_a = now + DUREE_PAUSE_S   # stopper le radar
-            assistant.annoncer_detection(a, d)    # lancer la voix
+            assistant.annoncer_detection(a, d)   
 
         points = [p for p in points if p.vivant()]
 
@@ -740,7 +731,7 @@ def main():
             angle_actuel, len(points), clock.get_fps(),
             vocal_ok  = assistant.pret,
             en_pause  = en_pause,
-            tps_pause = max(0.0, pause_jusqu_a - now),
+            tps_pause = 0.0 if assistant.occupe else max(0.0, pause_jusqu_a - now),
         )
         pygame.display.flip()
 

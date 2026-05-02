@@ -1,0 +1,4 @@
+
+run cette commande dans ton terminal(dans le dossier du projet)
+
+pip install pygame pyserial google-genai
